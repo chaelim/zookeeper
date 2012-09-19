@@ -61,6 +61,7 @@
         //what the....we use default socket connection time out
         //internal TimeSpan connectTimeout;
         internal TimeSpan readTimeout;
+        internal int pingIntervalMs;
         private int isClosed;
         public bool IsClosed
         {
@@ -165,11 +166,20 @@
             serverAddrs.OrderBy(s => Guid.NewGuid()); //Random order the servers
         }
 
-        private void SetTimeouts(TimeSpan sessionTimeout)
+        internal void SetTimeouts (TimeSpan sessionTimeout)
         {
             //since we have no need of it just remark it
             //connectTimeout = new TimeSpan(0, 0, 0, 0, Convert.ToInt32(sessionTimeout.TotalMilliseconds / serverAddrs.Count));
             readTimeout = new TimeSpan(0, 0, 0, 0, Convert.ToInt32(sessionTimeout.TotalMilliseconds * 2 / 3));
+            pingIntervalMs = Convert.ToInt32(readTimeout.TotalMilliseconds / 2);
+        }
+
+        internal void SetTimeouts(int sessionTimeoutMs)
+        {
+            //since we have no need of it just remark it
+            //connectTimeout = new TimeSpan(0, 0, 0, 0, Convert.ToInt32(sessionTimeout.TotalMilliseconds / serverAddrs.Count));
+            readTimeout = new TimeSpan(0, 0, 0, 0, (int)(sessionTimeoutMs * 2.0 / 3.0));
+            pingIntervalMs = (int)(sessionTimeoutMs / 2.0);
         }
 
         /// <summary>
@@ -248,13 +258,26 @@
 
                 try
                 {
-                    SubmitRequest(new RequestHeader { Type = (int)OpCode.CloseSession }, null, null, null);
-                    SpinWait spin = new SpinWait();
-                    while (!producer.IsConnectionClosedByServer)
+                    ReplyHeader r = SubmitRequest(new RequestHeader { Type = (int)OpCode.CloseSession }, null, null, null);
+
+                    // @@@ Fixed a shutdown deadlock bug
+                    // @@@ Repro steps.
+                    // @@@  1. Run ZooKeeper server
+                    // @@@  2. Client (ZooKeeperNet) connect to the server and issue some commands
+                    // @@@  3. Kill ZooKeeper server
+                    // @@@  4. Close (exit) ZooKeeper client
+                    // @@@ 
+                    // @@@ Added error code checking in ReplayHeader to prevent the infinite spin waiting.
+                    // @@@ TODO: It'd be a good idea add some waiting timeout inside the sping waiting loop.
+                    if (r.Err == 0 /* (int)KeeperException.Code.OK */)
                     {
-                        spin.SpinOnce();
-                        if (spin.Count > maxSpin)
-                            spin.Reset();
+                        SpinWait spin = new SpinWait();
+                        while (!producer.IsConnectionClosedByServer)
+                        {
+                            spin.SpinOnce();
+                            if (spin.Count > maxSpin)
+                                spin.Reset();
+                        }
                     }
                 }
                 catch (ThreadInterruptedException)
@@ -300,7 +323,7 @@
                 .Append(" recv:").Append(producer.recvCount)
                 .Append(" queuedpkts:").Append(producer.OutgoingQueueCount)
                 .Append(" pendingresp:").Append(producer.PendingQueueCount)
-                .Append(" queuedevents:").Append(consumer.waitingEvents.Count);
+                .Append(" queuedevents:").Append(consumer.WaitingEventQueueCount);
 
             return sb.ToString();
         }

@@ -24,8 +24,10 @@ namespace ZooKeeperNet
         private readonly ZooKeeper zooKeeper;
         private readonly Thread requestThread;
 
-        private readonly ConcurrentQueue<Packet> pendingQueue = new ConcurrentQueue<Packet>();
-        private readonly LinkedList<Packet> outgoingQueue = new LinkedList<Packet>();
+        private readonly ConcurrentQueue<Packet> pendingQueue = new ConcurrentQueue<Packet>();  // Pending request (that waiting for response) queue
+        private readonly BlockingCollection<Packet> outgoingQueue = new BlockingCollection<Packet>();
+        private readonly CancellationTokenSource m_cts;
+
         public int PendingQueueCount
         {
             get
@@ -68,7 +70,11 @@ namespace ZooKeeperNet
         {
             this.conn = conn;
             zooKeeper = conn.zooKeeper;
-            requestThread = new Thread(new SafeThreadStart(SendRequests).Run) { Name = new StringBuilder("ZK-SendThread ").Append(conn.zooKeeper.Id).ToString(), IsBackground = true };
+            m_cts = new CancellationTokenSource();
+            requestThread = new Thread(new SafeThreadStart(SendRequests).Run)
+                {
+                    Name = new StringBuilder("ZK-SendThread ").Append(conn.zooKeeper.Id).ToString(), IsBackground = true
+                };
         }
 
         protected int Xid
@@ -100,67 +106,48 @@ namespace ZooKeeperNet
                 if (h.Type == (int)OpCode.CloseSession)
                     closing = true;
                 // enqueue the packet when zookeeper is connected
-                lock (outgoingQueue)
-                {
-                    outgoingQueue.AddLast(p);
-                }
+                outgoingQueue.Add(p);
             }
             return p;
         }
 
+        /// <summary>
+        /// Request Send ThreadProc
+        /// </summary>
         private void SendRequests()
         {
-            DateTime now = DateTime.Now;
-            DateTime lastSend = now;
             Packet packet = null;
-            SpinWait spin = new SpinWait();
+
             while (zooKeeper.State.IsAlive())
             {
                 try
                 {
-                    now = DateTime.Now;
                     if (client == null || !client.Connected || zooKeeper.State == ZooKeeper.States.NOT_CONNECTED)
                     {
                         // don't re-establish connection if we are closing
-                        if(conn.IsClosed || closing)
+                        if (conn.IsClosed || closing)
                             break;
 
                         StartConnect();
-                        lastSend = now;
                     }
-                    TimeSpan idleSend = now - lastSend;
-                    if (zooKeeper.State == ZooKeeper.States.CONNECTED)
-                    {
-                        TimeSpan timeToNextPing = new TimeSpan(0, 0, 0, 0, Convert.ToInt32(conn.readTimeout.TotalMilliseconds / 2 - idleSend.TotalMilliseconds));
-                        if (timeToNextPing <= TimeSpan.Zero)
-                            SendPing();
-                    }
-                    // Everything below and until we get back to the select is
-                    // non blocking, so time is effectively a constant. That is
-                    // Why we just have to do this once, here                    
 
-                    packet = null;
-                    lock (outgoingQueue)
+                    if (outgoingQueue.TryTake(out packet, conn.pingIntervalMs, m_cts.Token))
                     {
-                        if(!outgoingQueue.IsEmpty())
-                        {
-                            packet = outgoingQueue.First();
-                            outgoingQueue.RemoveFirst();
-                            // We have something to send so it's the same
-                            // as if we do the send now.                        
-                            DoSend(packet);
-                            lastSend = DateTime.Now;
-                            packet = null;
-                        }
-                        else
-                        {
-                            // spin the processor
-                            spin.SpinOnce();
-                            if (spin.Count > ClientConnection.maxSpin)
-                                // reset the spinning counter
-                                spin.Reset();
-                        }
+                        // We have something to send so it's the same
+                        // as if we do the send now.                     
+                        DoSend(packet);
+                        packet = null;
                     }
+                    else
+                    {
+                        SendPing();
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // clean up any queued packet
+                    Cleanup();
+                    break;
                 }
                 catch (Exception e)
                 {
@@ -187,9 +174,10 @@ namespace ZooKeeperNet
                         // a safe-net ...there's a packet about to send when an exception happen
                         if (packet != null)
                             ConLossPacket(packet);
+
                         // clean up any queued packet
                         Cleanup();
-                        if(zooKeeper.State.IsAlive())
+                        if (zooKeeper.State.IsAlive())
                         {
                             conn.consumer.QueueEvent(new WatchedEvent(KeeperState.Disconnected, EventType.None, null));
                         }
@@ -228,18 +216,12 @@ namespace ZooKeeperNet
                 }
             }
            
-            lock (outgoingQueue)
-            {
-                foreach (var packet in outgoingQueue)
-                {
-                    ConLossPacket(packet);
-                }
-                outgoingQueue.Clear();
-            }
+            Packet packet;
+            while (outgoingQueue.TryTake(out packet))
+                ConLossPacket(packet);
 
-            Packet pack;
-            while (pendingQueue.TryDequeue(out pack))
-                ConLossPacket(pack);
+            while (pendingQueue.TryDequeue(out packet))
+                ConLossPacket(packet);
         }
 
         private void StartConnect()
@@ -377,23 +359,22 @@ namespace ZooKeeperNet
             lastConnectIndex = currentConnectIndex;
             ConnectRequest conReq = new ConnectRequest(0, lastZxid, Convert.ToInt32(conn.SessionTimeout.TotalMilliseconds), conn.SessionId, conn.SessionPassword);
 
-            lock (outgoingQueue)
+            outgoingQueue.Add(new Packet(null, null, conReq, null, null, null, null, null));
+
+            foreach (ClientConnection.AuthData id in conn.authInfo)
             {
-                if (!ClientConnection.disableAutoWatchReset && (!zooKeeper.DataWatches.IsEmpty() || !zooKeeper.ExistWatches.IsEmpty() || !zooKeeper.ChildWatches.IsEmpty()))
-                {
-                    var sw = new SetWatches(lastZxid, zooKeeper.DataWatches, zooKeeper.ExistWatches, zooKeeper.ChildWatches);
-                    var h = new RequestHeader();
-                    h.Type = (int)OpCode.SetWatches;
-                    h.Xid = -8;
-                    Packet packet = new Packet(h, new ReplyHeader(), sw, null, null, null, null, null);
-                    outgoingQueue.AddFirst(packet);
-                }
+                outgoingQueue.Add(
+                    new Packet(new RequestHeader(-4, (int)OpCode.Auth), null, new AuthPacket(0, id.Scheme, id.GetData()), null, null, null, null, null));
+            }
 
-                foreach (ClientConnection.AuthData id in conn.authInfo)
-                    outgoingQueue.AddFirst(
-                        new Packet(new RequestHeader(-4, (int) OpCode.Auth), null, new AuthPacket(0, id.Scheme, id.GetData()), null, null, null, null, null));
-
-                outgoingQueue.AddFirst(new Packet(null, null, conReq, null, null, null, null, null));
+            if (!ClientConnection.disableAutoWatchReset && (!zooKeeper.DataWatches.IsEmpty() || !zooKeeper.ExistWatches.IsEmpty() || !zooKeeper.ChildWatches.IsEmpty()))
+            {
+                var sw = new SetWatches(lastZxid, zooKeeper.DataWatches, zooKeeper.ExistWatches, zooKeeper.ChildWatches);
+                var h = new RequestHeader();
+                h.Type = (int)OpCode.SetWatches;
+                h.Xid = -8;
+                Packet packet = new Packet(h, new ReplyHeader(), sw, null, null, null, null, null);
+                outgoingQueue.Add(packet);
             }
 
             if (LOG.IsDebugEnabled)
@@ -451,7 +432,7 @@ namespace ZooKeeperNet
                     conn.consumer.QueueEvent(new WatchedEvent(KeeperState.Expired, EventType.None, null));
                     throw new SessionExpiredException(new StringBuilder().AppendFormat("Unable to reconnect to ZooKeeper service, session 0x{0:X} has expired", conn.SessionId).ToString());
                 }
-                conn.readTimeout = new TimeSpan(0, 0, 0, 0, negotiatedSessionTimeout * 2 / 3);
+                conn.SetTimeouts(negotiatedSessionTimeout);
                 // commented...we haven't need this information yet...
                 //conn.connectTimeout = new TimeSpan(0, 0, 0, negotiatedSessionTimeout / conn.serverAddrs.Count);
                 conn.SessionId = conRsp.SessionId;
@@ -583,6 +564,7 @@ namespace ZooKeeperNet
                 {
                     if (requestThread.IsAlive)
                     {
+                        m_cts.Cancel();
                         requestThread.Join();
                     } 
                 }
