@@ -30,8 +30,17 @@ using System.Collections.Generic;
 
         private readonly ClientConnection conn;
         private readonly Thread eventThread;
-        //ConcurrentQueue gives us the non-blocking way of processing, it reduced the contention so much
-        internal readonly ConcurrentQueue<ClientConnection.WatcherSetEventPair> waitingEvents = new ConcurrentQueue<ClientConnection.WatcherSetEventPair>();
+        private readonly BlockingCollection<ClientConnection.WatcherSetEventPair> waitingEvents =
+            new BlockingCollection<ClientConnection.WatcherSetEventPair>();
+        private readonly CancellationTokenSource m_cts;
+
+        public int WaitingEventQueueCount
+        {
+            get
+            {
+                return waitingEvents.Count;
+            }
+        }
 
         /** This is really the queued session state until the event
          * thread actually processes the event and hands it to the watcher.
@@ -42,6 +51,7 @@ using System.Collections.Generic;
         public ClientConnectionEventConsumer(ClientConnection conn)
         {
             this.conn = conn;
+            m_cts = new CancellationTokenSource();
             eventThread = new Thread(new SafeThreadStart(PollEvents).Run) { Name = new StringBuilder("ZK-EventThread ").Append(conn.zooKeeper.Id).ToString(), IsBackground = true };
         }
 
@@ -65,23 +75,21 @@ using System.Collections.Generic;
             }
         }
 
+        /// <summary>
+        /// Event polling ThreadProc
+        /// </summary>
         public void PollEvents()
         {
             try
             {
-                SpinWait spin = new SpinWait();
-                while(Interlocked.CompareExchange(ref isDisposed, 1, 1) == 0)
+                while (isDisposed == 0)
                 {
                     try
                     {
                         ClientConnection.WatcherSetEventPair pair;
-                        if (waitingEvents.TryDequeue(out pair))
-                            ProcessWatcher(pair.Watchers, pair.WatchedEvent);
-                        else
+                        if (waitingEvents.TryTake(out pair, -1, m_cts.Token))
                         {
-                            spin.SpinOnce();
-                            if (spin.Count > ClientConnection.maxSpin)
-                                spin.Reset();
+                            ProcessWatcher(pair.Watchers, pair.WatchedEvent);
                         }
                         
                     }
@@ -93,7 +101,8 @@ using System.Collections.Generic;
                     }
                     catch (OperationCanceledException)
                     {
-                        //ignored
+                        // Token canceled. Started shutdown.
+                        break;
                     }
                     catch (Exception t)
                     {
@@ -121,7 +130,7 @@ using System.Collections.Generic;
             // materialize the watchers based on the event
             var pair = new ClientConnection.WatcherSetEventPair(conn.watcher.Materialize(@event.State, @event.Type,@event.Path), @event);
             // queue the pair (watch set & event) for later processing
-            waitingEvents.Enqueue(pair);
+            waitingEvents.Add(pair);
         }
 
         private int isDisposed = 0;
@@ -133,11 +142,12 @@ using System.Collections.Generic;
                 {
                     if (eventThread.IsAlive)
                     {
+                        m_cts.Cancel();
                         eventThread.Join();
                     }
                     //process any unprocessed event
                     ClientConnection.WatcherSetEventPair pair;
-                    while (waitingEvents.TryDequeue(out pair))
+                    while (waitingEvents.TryTake(out pair))
                         ProcessWatcher(pair.Watchers, pair.WatchedEvent);  
                 }
                 catch (Exception ex)
