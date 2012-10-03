@@ -44,7 +44,7 @@ namespace ZooKeeperNet
         private int currentConnectIndex;
         private int initialized;
         internal long lastZxid;
-        private long lastPingSentNs;
+        private uint lastPingSentMs;
         internal int xid = 1;
         private volatile bool closing;
 
@@ -111,13 +111,17 @@ namespace ZooKeeperNet
             return p;
         }
 
+        public static uint GetCurrentTimeMs()
+        {
+            return unchecked((uint)(Environment.TickCount));
+        }
+
         /// <summary>
         /// Request Send ThreadProc
         /// </summary>
         private void SendRequests()
         {
             Packet packet = null;
-
             while (zooKeeper.State.IsAlive())
             {
                 try
@@ -131,12 +135,21 @@ namespace ZooKeeperNet
                         StartConnect();
                     }
 
-                    if (outgoingQueue.TryTake(out packet, conn.pingIntervalMs, m_cts.Token))
+                    uint pingWaitMs = (lastPingSentMs + (uint)conn.pingIntervalMs) - GetCurrentTimeMs();
+
+                    if ((int)pingWaitMs < 0)
+                        pingWaitMs = 0;
+
+                    if (outgoingQueue.TryTake(out packet, (int)pingWaitMs, m_cts.Token))
                     {
-                        // We have something to send so it's the same
-                        // as if we do the send now.                     
-                        DoSend(packet);
-                        packet = null;
+                        if (packet != null)
+                        {
+                            // We have something to send so it's the same
+                            // as if we do the send now.                     
+                            DoSend(packet);
+                            lastPingSentMs = GetCurrentTimeMs();
+                            packet = null;
+                        }
                     }
                     else
                     {
@@ -218,10 +231,16 @@ namespace ZooKeeperNet
            
             Packet packet;
             while (outgoingQueue.TryTake(out packet))
-                ConLossPacket(packet);
+            {
+                if (packet != null)
+                    ConLossPacket(packet);
+            }
 
             while (pendingQueue.TryDequeue(out packet))
-                ConLossPacket(packet);
+            {
+                if (packet != null)
+                    ConLossPacket(packet);
+            }
         }
 
         private void StartConnect()
@@ -309,6 +328,7 @@ namespace ZooKeeperNet
                     LOG.Debug("TcpClient connection lost.");
                     zooKeeper.State = ZooKeeper.States.NOT_CONNECTED;
                     IsConnectionClosedByServer = true;
+                    outgoingQueue.Add(null);
                     return;
                 }
                 byte[] bData = (byte[])ar.AsyncState;
@@ -350,6 +370,8 @@ namespace ZooKeeperNet
             catch (Exception ex)
             {
                 LOG.Error(ex);
+                // Wake up SendRequests thread
+                outgoingQueue.Add(null);
             }
         }
 
@@ -383,7 +405,7 @@ namespace ZooKeeperNet
 
         private void SendPing()
         {
-            lastPingSentNs = DateTime.Now.Nanos();
+            lastPingSentMs = GetCurrentTimeMs();
             RequestHeader h = new RequestHeader(-2, (int)OpCode.Ping);
             conn.QueuePacket(h, null, null, null, null, null, null, null, null);
         }
@@ -455,7 +477,7 @@ namespace ZooKeeperNet
                 {
                     // -2 is the xid for pings
                     if (LOG.IsDebugEnabled)
-                        LOG.DebugFormat("Got ping response for sessionid: 0x{0:X} after {1}ms", conn.SessionId, (DateTime.Now.Nanos() - lastPingSentNs) / 1000000);
+                        LOG.DebugFormat("Got ping response for sessionid: 0x{0:X} after {1}ms", conn.SessionId, GetCurrentTimeMs() - lastPingSentMs);
                     return;
                 }
                 if (replyHdr.Xid == -4)
