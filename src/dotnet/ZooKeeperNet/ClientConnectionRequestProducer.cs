@@ -45,6 +45,7 @@ namespace ZooKeeperNet
         private int initialized;
         internal long lastZxid;
         private uint lastPingSentMs;
+        private uint lastPingDebugLogMs;
         internal int xid = 1;
         private volatile bool closing;
 
@@ -111,9 +112,12 @@ namespace ZooKeeperNet
             return p;
         }
 
-        public static uint GetCurrentTimeMs()
+        public static uint CurrentSystemMs
         {
-            return unchecked((uint)(Environment.TickCount));
+            get
+            {
+                return unchecked((uint)(Environment.TickCount));
+            }
         }
 
         /// <summary>
@@ -135,7 +139,7 @@ namespace ZooKeeperNet
                         StartConnect();
                     }
 
-                    uint pingWaitMs = (lastPingSentMs + (uint)conn.pingIntervalMs) - GetCurrentTimeMs();
+                    uint pingWaitMs = (lastPingSentMs + (uint)conn.pingIntervalMs) - CurrentSystemMs;
 
                     if ((int)pingWaitMs < 0)
                         pingWaitMs = 0;
@@ -147,7 +151,7 @@ namespace ZooKeeperNet
                             // We have something to send so it's the same
                             // as if we do the send now.                     
                             DoSend(packet);
-                            lastPingSentMs = GetCurrentTimeMs();
+                            lastPingSentMs = CurrentSystemMs;
                             packet = null;
                         }
                     }
@@ -405,7 +409,7 @@ namespace ZooKeeperNet
 
         private void SendPing()
         {
-            lastPingSentMs = GetCurrentTimeMs();
+            lastPingSentMs = CurrentSystemMs;
             RequestHeader h = new RequestHeader(-2, (int)OpCode.Ping);
             conn.QueuePacket(h, null, null, null, null, null, null, null, null);
         }
@@ -476,18 +480,38 @@ namespace ZooKeeperNet
                 if (replyHdr.Xid == -2)
                 {
                     // -2 is the xid for pings
-                    if (LOG.IsDebugEnabled)
-                        LOG.DebugFormat("Got ping response for sessionid: 0x{0:X} after {1}ms", conn.SessionId, GetCurrentTimeMs() - lastPingSentMs);
+                    uint reponseMs = CurrentSystemMs - this.lastPingSentMs;
+                    if (reponseMs >= 200)
+                    {
+                        LOG.WarnFormat(
+                            "Bad ping time for sessionid: 0x{0:X}, {1}ms",
+                            conn.SessionId,
+                            reponseMs
+                        );
+                        lastPingDebugLogMs = CurrentSystemMs;
+                    }
+                    else if (LOG.IsDebugEnabled 
+                          && CurrentSystemMs - this.lastPingDebugLogMs > 1000 * 60 * 2)
+                    {
+                        LOG.DebugFormat(
+                            "Got ping response for sessionid: 0x{0:X} after {1}ms",
+                            conn.SessionId,
+                            reponseMs
+                        );
+                        lastPingDebugLogMs = CurrentSystemMs;
+                    }
                     return;
                 }
+
                 if (replyHdr.Xid == -4)
                 {
-                    // -2 is the xid for AuthPacket
+                    // -4 is the xid for AuthPacket
                     // TODO: process AuthPacket here
                     if (LOG.IsDebugEnabled)
                         LOG.DebugFormat("Got auth sessionid:0x{0:X}", conn.SessionId);
                     return;
                 }
+
                 if (replyHdr.Xid == -1)
                 {
                     // -1 means notification
@@ -516,9 +540,9 @@ namespace ZooKeeperNet
                 }
                 Packet packet;
                 /*
-             * Since requests are processed in order, we better get a response
-             * to the first request!
-             */
+                 * Since requests are processed in order, we better get a response
+                 * to the first request!
+                 */
                 if (pendingQueue.TryDequeue(out packet))
                 {
                     try

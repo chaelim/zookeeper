@@ -67,7 +67,7 @@
         {
             get
             {
-                return Interlocked.CompareExchange(ref isClosed, 0, 0) == 1;
+                return isClosed == 1;
             }
         }
         internal ClientConnectionRequestProducer producer;
