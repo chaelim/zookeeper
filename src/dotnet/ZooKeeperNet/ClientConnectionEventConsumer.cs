@@ -22,7 +22,7 @@
     using System.Threading;
     using log4net;
     using System.Text;
-using System.Collections.Generic;
+    using System.Collections.Generic;
 
     public class ClientConnectionEventConsumer : IStartable, IDisposable
     {

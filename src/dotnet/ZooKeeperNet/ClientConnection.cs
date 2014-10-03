@@ -166,7 +166,7 @@
             serverAddrs.OrderBy(s => Guid.NewGuid()); //Random order the servers
         }
 
-        internal void SetTimeouts (TimeSpan sessionTimeout)
+        internal void SetTimeouts(TimeSpan sessionTimeout)
         {
             //since we have no need of it just remark it
             //connectTimeout = new TimeSpan(0, 0, 0, 0, Convert.ToInt32(sessionTimeout.TotalMilliseconds / serverAddrs.Count));
@@ -268,7 +268,7 @@
                     // @@@  4. Close (exit) ZooKeeper client
                     // @@@ 
                     // @@@ Added error code checking in ReplayHeader to prevent the infinite spin waiting.
-                    // @@@ TODO: It'd be a good idea add some waiting timeout inside the sping waiting loop.
+                    // @@@ TODO: It'd be a good idea add some waiting timeout inside the spin waiting loop.
                     if (r.Err == 0 /* (int)KeeperException.Code.OK */)
                     {
                         SpinWait spin = new SpinWait();
